@@ -1,0 +1,533 @@
+// ============================================================================
+//  H1_temporal_fragmentation_PATCHWISE_CHANGE.js  ⭐ UPDATED ⭐  (annotated)
+//  --------------------------------------------------------------------------
+//  Purpose: Detect landscape‑change & fragmentation over four decadal snapshots
+//           (1985, 1994, 2009, 2023) within 25‑km buffers around study patches.
+//
+//  What this annotated version adds
+//  ────────────────────────────────
+//  • Pre‑section doc‑blocks that outline each major step of the workflow.
+//  • Side comments explaining “magic numbers” (e.g. buffer sizes, RF params).
+//  • Inline notes on why particular Earth Engine reducers / transforms are used.
+//  • No functional edits; behaviour is identical to the original script.
+//
+//  Learning objectives
+//  ───────────────────
+//  Readers should be able to…
+//    1. Follow the end‑to‑end GEE pipeline: preprocessing → classification →
+//       validation → export → change‑detection.
+//    2. Understand the rationale behind algorithmic choices & default values.
+//    3. Adapt the script to other regions, periods, or class schemes.
+// ============================================================================
+
+// ───────────────────────── 0.  Study periods ─────────────────────────
+//  Four 3‑year windows centred on the target years. Using ±1 year widens the
+//  sample pool to ensure sufficient clear LANDSAT observations.
+var PERIODS = [
+  {name: '1985', start: '1984-01-01', end: '1986-12-31'},
+  {name: '1994', start: '1993-01-01', end: '1995-12-31'},
+  {name: '2009', start: '2008-01-01', end: '2010-12-31'},
+  {name: '2023', start: '2022-01-01', end: '2023-12-31'}
+];
+
+// ───────────────────────── globals for change‑detection ──────────────
+//  LC_IMAGES will cache the classified ee.Image for each period so we can
+//  compare them later (outside the main processing loop).
+var LC_IMAGES = {};   // e.g. LC_IMAGES['1985'] → ee.Image
+
+// ───────────────────────── 1.  AOI (25‑km buffers) ───────────────────
+//  Load patch centroids, project to WGS84, then buffer EACH by 25 km (25000 m)
+//  to build the Area Of Interest. The union is finally bounded to drop any
+//  stray antimeridian wrapping.
+var patchFC = ee.FeatureCollection('projects/ee-irisharaya2024/assets/patchlocation');
+patchFC = patchFC.map(function (f) {
+  return ee.Feature(f.geometry().transform('EPSG:4326', 1), f.toDictionary());
+});
+// 25 000 m = 25 km buffer — a compromise between capturing landscape context
+// around each point while keeping processing cost manageable.
+var AOI = ee.Geometry(patchFC.map(function (pt) { return pt.buffer(25000); }).union().geometry().bounds());
+
+// ───────────────────────── helpers (unchanged) ──────────────────────
+//  *safePrint* guards against nulls; the others encapsulate reusable tasks.
+function safePrint(label, value) { value ? print(label + ':', value) : print(label + ': (no data)'); }
+function prepTraining(path) { /* …  unchanged … */ }
+function prepSR(img)       { /* …  unchanged … */ }
+function getComposite(s,e) { /* …  unchanged … */ }
+function validateTrainingData(){ /* …  unchanged … */ }
+function sampleTraining(img, polys, yr){ /* …  unchanged … */ }
+function trainRF(smp){ /* …  unchanged … */ }
+function kFoldCV(smp,k){ /* …  unchanged … */ }
+function calculateFragmentationSimple(forest, geom){ /* …  unchanged … */ }
+
+// ───────────────────────── 2.  Training data ────────────────────────
+//  Each year has its own hand‑labelled polygons (assets). The helper below
+//  reprojects geometries, parses the 'class' property to integer, and returns
+//  a cleaned FeatureCollection.
+function prepTraining(path) {
+  return ee.FeatureCollection(path)
+          .map(function (f) {
+            var g = f.geometry().transform('EPSG:4326', 1);
+            return ee.Feature(g, f.toDictionary())
+                      .set('class', ee.Number.parse(f.get('class')));
+          });
+}
+
+var TRAIN = {
+  '1985': prepTraining('projects/ee-irisharaya2024/assets/trainingdata1985'),
+  '1994': prepTraining('projects/ee-irisharaya2024/assets/trainingdata1994'),
+  '2009': prepTraining('projects/ee-irisharaya2024/assets/trainingdata2009'),
+  '2023': prepTraining('projects/ee-irisharaya2024/assets/trainingdata2023')
+};
+
+// ───────────────────────── 3.  Image preprocessing ──────────────────
+//  Converts raw Collection‑2 surface‑reflectance to calibrated reflectance,
+//  applies cloud & shadow mask (bit 3 & 4 clear), rescales, and renames to
+//  common Landsat bandset (B1‑B7).
+function prepSR(img) {
+
+  var sensor = img.getString('SPACECRAFT_ID');
+
+  // Per‑sensor gain factors from USGS docs — slight cross‑sensor harmonisation.
+  var gains = ee.Dictionary({
+    'LANDSAT_5': [1.0282, 1.0096, 0.9702, 0.9852, 1.0044, 0.9965],
+    'LANDSAT_7': [1.0043, 0.9833, 0.9627, 0.9710, 1.0173, 1.0038],
+    'LANDSAT_8': [1, 1, 1, 1, 1, 1],
+    'LANDSAT_9': [1, 1, 1, 1, 1, 1]
+  });
+
+  var bandLists = ee.Dictionary({
+    'LANDSAT_5': ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'],
+    'LANDSAT_7': ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'],
+    'LANDSAT_8': ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'],
+    'LANDSAT_9': ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
+  });
+
+  var refl = img.select(bandLists.get(sensor))
+                // 0.0000275 & −0.2 = Collection‑2 scaling factors (see USGS)
+                .multiply(0.0000275).add(-0.2)
+                .multiply(ee.Image.constant(gains.get(sensor)))
+                .rename(['B1', 'B2', 'B3', 'B4', 'B5', 'B7'])
+                .toFloat();
+
+  // QA_PIXEL mask: bitwise 3 → cloud shadow, 4 → clouds. Keep only where both
+  // bits == 0.
+  var qa = img.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+              .and(qa.bitwiseAnd(1 << 4).eq(0));
+
+  return refl.updateMask(mask)
+            .copyProperties(img,
+                            ['system:time_start', 'SPACECRAFT_ID']);
+}
+
+// ───────────────────────── 4.  Composite builder ────────────────────
+//  For each period, merge the four Landsat collections (5,7,8,9), filter to
+//  AOI, time‑window & <80 % cloud cover, then:
+//    • Compute median mosaic (robust to noise)
+//    • Add NDVI & NDWI as spectral indices
+//    • Return a 8‑band image (6 reflectance + NDVI + NDWI)
+function getComposite(start, end) {
+
+  var coll = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+              .merge(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'))
+              .merge(ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'))
+              .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+              .filterDate(start, end)
+              .filterBounds(AOI)
+              .filter(ee.Filter.lt('CLOUD_COVER', 80))  // generous 80 % thresh
+              .map(prepSR);
+
+  // Diagnostic print: how many images per period after filtering?
+  coll.size().evaluate(function (n) {
+    print('Images', start, '→', end, ':', n);
+  });
+
+  var imgCount = coll.size();
+  var median   = coll.median().clip(AOI);
+  var ndvi     = median.normalizedDifference(['B4', 'B3']).rename('NDVI');
+  var ndwi     = median.normalizedDifference(['B2', 'B4']).rename('NDWI');
+  var eightBands = median.addBands([ndvi, ndwi]);
+
+  // Return empty image if no scenes (avoids crash downstream)
+  return ee.Image(
+          ee.Algorithms.If(
+            imgCount.gt(0),
+            eightBands,
+            ee.Image([])
+          )
+        );
+}
+
+// ───────────────────────── Training Data Validation ──────────────────────────
+//  Quick sanity checks before heavy processing: size, class balance, geometry
+//  validity, etc. Helps catch missing asset uploads early.
+function validateTrainingData() {
+  Object.keys(TRAIN).forEach(function(year) {
+    var train = TRAIN[year];
+
+    print('=== Validating training data for', year, '===');
+
+    // Size of dataset
+    train.size().evaluate(function(size) {
+      print('  Training polygons:', size);
+    });
+
+    // Histogram of classes
+    var classes = train.aggregate_histogram('class');
+    classes.evaluate(function(hist) {
+      print('  Class distribution:', hist);
+    });
+
+    // Geometries present?
+    var validGeoms = train.filter(ee.Filter.neq('geometry', null));
+    validGeoms.size().evaluate(function(validSize) {
+      print('  Valid geometries:', validSize);
+    });
+
+    // Unique class values list
+    var classValues = train.aggregate_array('class').distinct();
+    classValues.evaluate(function(vals) {
+      print('  Unique class values:', vals);
+    });
+
+    // Visual preview on map (yellow outlines)
+    Map.addLayer(train, {color: 'yellow'}, 'Training_' + year);
+  });
+}
+
+// Call before processing
+validateTrainingData();
+
+// ───────────────────────── 5.  Sample extraction ────────────────────
+//  Draw balanced per‑class pixel samples from composite. Each class is capped
+//  at *perClass* (250) and duplicated if fewer are available (to reduce class
+//  imbalance). Random column seeded by target year for reproducibility.
+function sampleTraining(img, polys, yr) {
+  print('Sampling training data for', yr);
+
+  if (img.bandNames().size().getInfo() === 0) {
+    print('  ERROR: No bands in composite for', yr);
+    return ee.FeatureCollection([]);
+  }
+
+  // Diagnostics: list bands available
+  img.bandNames().evaluate(function(bands) {
+    print('  Available bands:', bands);
+  });
+
+  var seed = ee.Number.parse(yr);   // ensure diff seed per year
+  var perClass = 250;               // ← tweak if dataset very unbalanced
+
+  // Use only polygons intersecting composite footprint (skip empty areas)
+  var imgBounds = img.geometry();
+  var intersecting = polys.filterBounds(imgBounds);
+
+  intersecting.size().evaluate(function(count) {
+    print('  Training polygons intersecting image:', count);
+  });
+
+  var raw = img.sampleRegions({
+              collection : intersecting,
+              properties : ['class'],
+              scale      : 30,    // Landsat resolution
+              tileScale  : 4,     // bigger → fewer server errors, slower
+              geometries : true   // keep geom for debugging / visual QC
+            })
+            .filter(ee.Filter.neq('B1', null))  // null = masked pixel
+            .randomColumn('rnd', seed);
+
+  // Raw sample diagnostics
+  raw.size().evaluate(function(rawCount) {
+    print('  Raw samples extracted:', rawCount);
+  });
+
+  var classes = ee.List(raw.aggregate_array('class').distinct());
+
+  classes.evaluate(function(classList) {
+    print('  Classes found in samples:', classList);
+  });
+
+  // Balance each class to *perClass* (with duplication if needed)
+  var balanced = ee.FeatureCollection(
+    classes.iterate(function (c, acc) {
+      c = ee.Number(c);
+      var subset = raw.filter(ee.Filter.eq('class', c))
+                      .sort('rnd').limit(perClass);
+
+      var currentSize = subset.size();
+      var need = ee.Number(perClass).subtract(currentSize);
+
+      var dup = ee.FeatureCollection(
+                  ee.Algorithms.If(
+                    need.gt(0).and(currentSize.gt(0)),
+                    subset.randomColumn('dup', seed.add(c))
+                          .sort('dup')
+                          .limit(need),
+                    ee.FeatureCollection([])
+                  )
+                );
+
+      return ee.FeatureCollection(acc).merge(subset).merge(dup);
+
+    }, ee.FeatureCollection([]))
+  );
+
+  // Final validation
+  balanced.size().evaluate(function(finalCount) {
+    print('  Final balanced samples:', finalCount);
+  });
+
+  var finalClasses = balanced.aggregate_histogram('class');
+  finalClasses.evaluate(function(finalHist) {
+    print('  Final class distribution:', finalHist);
+  });
+
+  return balanced;
+}
+
+// ─────────────────── 6.  RF & cross‑validation helpers ─────────────
+//  Random Forest with 200 trees, √N variable selection (≈4 of 8 bands). Bag
+//  fraction 0.63 approximates bootstrap‑sampling.
+function trainRF(samples) {
+
+  return ee.Classifier.smileRandomForest({
+          numberOfTrees     : 200,
+          variablesPerSplit : 4,    // ≈√8
+          bagFraction       : 0.63, // default bootstrap ratio
+          seed              : 42
+        }).train({
+          features       : samples,
+          classProperty  : 'class',
+          inputProperties: samples.first()
+                                  .propertyNames()
+                                  .removeAll(
+                                    ['class', 'rnd', 'dup',
+                                      'fold', 'system:index']
+                                  )
+        });
+}
+
+// 5‑fold CV: split samples by random fold column into 80‑20 train/test slices
+function kFoldCV(samples, k) {
+  print('Starting', k, '-fold CV...');
+
+  // Quick class balance print‑out
+  var classStats = samples.aggregate_histogram('class');
+  classStats.evaluate(function(hist) {
+    print('Class distribution:', hist);
+  });
+
+  var withFold = samples.randomColumn('fold', 42);
+
+  // Continuous [0,1) → integer 0‑(k‑1)
+  var foldCol = withFold.map(function(f) {
+    var foldVal = ee.Number(f.get('fold')).multiply(k).floor();
+    return f.set('fold', foldVal);
+  });
+
+  var folds = ee.List.sequence(0, k - 1).map(function (i) {
+    var train = foldCol.filter(ee.Filter.neq('fold', i));
+    var test  = foldCol.filter(ee.Filter.eq('fold', i));
+
+    var classifier = ee.Classifier.smileRandomForest({
+      numberOfTrees: 100,  // slightly lighter for CV
+      seed: 42
+    }).train({
+      features: train,
+      classProperty: 'class',
+      inputProperties: train.first().propertyNames()
+                          .removeAll(['class', 'rnd', 'dup', 'fold', 'system:index'])
+    });
+
+    var classified = test.classify(classifier);
+    var cm = classified.errorMatrix('class', 'classification');
+
+    return ee.Feature(null, {
+      fold: i,
+      oa: cm.accuracy(),   // overall accuracy
+      kappa: cm.kappa()
+    });
+  });
+
+  var fc = ee.FeatureCollection(folds);
+
+  return ee.Dictionary({
+    oa: fc.aggregate_mean('oa'),
+    kappa: fc.aggregate_mean('kappa')
+  });
+}
+
+// ─────────────────── 7.  Simple fragmentation metrics ──────────────
+//  *calculateFragmentationSimple* provides a quick proxy: % forest cover and
+//  an estimated patch count (√forest% * 10) inside each buffered patch.
+function calculateFragmentationSimple(forest, geom) {
+  // Forest = 1 where present, null elsewhere ➜ sum = # forest pixels
+  var forestSumDict = forest.reduceRegion({
+    reducer   : ee.Reducer.sum(),
+    geometry  : geom,
+    scale     : 60,      // coarser (60 m) for speed; we only need rough stats
+    tileScale : 4,
+    maxPixels : 1e10,
+    bestEffort: true
+  });
+  var forestPixels = ee.Number(forestSumDict.values().get(0));
+
+  var totalCntDict = forest.reduceRegion({
+    reducer   : ee.Reducer.count(),
+    geometry  : geom,
+    scale     : 60,
+    tileScale : 4,
+    maxPixels : 1e10,
+    bestEffort: true
+  });
+  var totalPixels = ee.Number(totalCntDict.values().get(0));
+
+  var forestPercent = ee.Algorithms.If(
+    totalPixels.gt(0),
+    forestPixels.divide(totalPixels),
+    0
+  );
+
+  // Patch‑count proxy (very rough): assume # patches scales with √(% cover)
+  var estimatedPatchCount = ee.Number(
+    ee.Algorithms.If(
+      ee.Number(forestPercent).gt(0.01),
+      ee.Number(forestPercent).multiply(100).sqrt().multiply(10),
+      0
+    )
+  );
+
+  return {
+    patch_count    : estimatedPatchCount,
+    forest_pixels  : forestPixels,
+    forest_percent : forestPercent
+  };
+} 
+
+// ───────────────────────── 8.  Per‑period routine ───────────────────
+//  For each period: (1) build composite, (2) sample & train RF, (3) classify,
+//  (4) export LC raster, training points, accuracy & patch‑wise metrics.
+function processPeriod(p) {
+  var name  = p.name, start = p.start, end = p.end;
+  var train = TRAIN[name];
+  if (!train) { print('⚠︎ No training data for', name); return ee.FeatureCollection([]);}  
+  var comp = getComposite(start, end);
+  if (comp.bandNames().size().getInfo() === 0) { print('⚠︎ No imagery for', name); return ee.FeatureCollection([]);}  
+
+  // 1▼ sample + CV + train RF ------------------------------------------------
+  var samples = sampleTraining(comp, train, name);
+  if (samples.size().getInfo() < 100) { print('⚠︎ Too few samples for', name); return ee.FeatureCollection([]);}  
+  var cvResults = kFoldCV(samples, 5);
+  cvResults.evaluate(function(r){ print('  CV Accuracy for', name + ':', r); });
+  var classifier = trainRF(samples);
+  var lc = comp.classify(classifier).uint8().set('year', name);
+  Map.addLayer(lc, {min:1,max:7,palette:['006400','A0522D','1E90FF','FFFF00','FF0000','C0C0C0','800080']}, 'LC_'+name);
+
+  // 2▼ cache image for later change‑detection -------------------------------
+  LC_IMAGES[name] = lc;   // server‑side ref
+
+  // 3▼ accuracy + patch exports --------------------------------------------
+  var accuracyFC = ee.FeatureCollection([ee.Feature(null, {year:name, oa:cvResults.get('oa'), kappa:cvResults.get('kappa')})]);
+  Export.table.toDrive({collection:accuracyFC, description:'Accuracy_'+name, folder:'H1_final', fileFormat:'CSV'});
+
+  var forest = lc.eq(1).selfMask();
+  var patchResults = patchFC.map(function (patch) {
+    var patchAOI = patch.geometry().buffer(25000);
+    var frag = calculateFragmentationSimple(forest, patchAOI);
+    var pc  = ee.Number(frag.patch_count);
+    var pd  = pc.divide(patchAOI.area(1).divide(1e4));  // density per ha
+    return patch.set({year:name, patch_count:pc, patch_density_ha:pd, forest_pixels:frag.forest_pixels, forest_percent:frag.forest_percent});
+  });
+
+  // 30 m export resolution = native Landsat
+  Export.image.toDrive({image:lc, description:'LC_'+name, folder:'H1_final', region:AOI, scale:30, maxPixels:1e13});
+  Export.table.toDrive({collection:samples, description:'Train_'+name, folder:'H1_final', fileFormat:'CSV'});
+  Export.table.toDrive({collection:patchResults, description:'FragPatch_'+name, folder:'H1_final', fileFormat:'CSV'});
+  return patchResults;
+}
+
+// ───────────────────────── 9.  Main loop (per‑patch) ─────────────────
+//  Iterate through PERIODS, merge all patch‑wise results, and export one
+//  consolidated CSV.
+var allPatchResults = ee.FeatureCollection([]);
+PERIODS.forEach(function(pr){
+  print('Processing period:', pr.name);
+  try{ allPatchResults = allPatchResults.merge(processPeriod(pr)); }
+  catch(err){ print('Error processing', pr.name, ':', err.toString()); }
+});
+Export.table.toDrive({collection:allPatchResults, description:'Fragmentation_metrics_patchwise_H1_final', folder:'H1_final', fileFormat:'CSV'});
+print('Patch‑wise processing complete!');
+
+// ───────────────────────── 10. Change‑detection block ────────────────
+//  For each consecutive period pair (e.g., 1985‑94) we:
+//    1. Compute change‑code image  old*100 + new  (e.g. 2→1 ⇒ 201)
+//    2. Export raster and summary CSV of area (ha) per transition type.
+var CHANGE_PAIRS = [['1985','1994'], ['1994','2009'], ['2009','2023']];
+CHANGE_PAIRS.forEach(function(pair){
+  var fromYr = pair[0], toYr = pair[1];
+  var imgFrom = LC_IMAGES[fromYr];
+  var imgTo   = LC_IMAGES[toYr];
+
+  if(!imgFrom || !imgTo){ print('⚠︎ Missing LC image for pair', fromYr + '→' + toYr); return; }
+
+  // 10.1▼ create change‑code image -----------------------------------
+  var changeImg = imgFrom.multiply(100).add(imgTo).rename('change');
+  Map.addLayer(changeImg.randomVisualizer(), {}, 'Δ ' + fromYr + '→' + toYr);
+
+  Export.image.toDrive({
+    image      : changeImg,
+    description: 'ChangeMap_'+fromYr+'_'+toYr,
+    folder     : 'H1_final',
+    region     : AOI,
+    scale      : 30,
+    maxPixels  : 1e13
+  });
+
+  // 10.2▼ tabulate pixel‑area per transition -------------------------
+  // Combine pixelArea() with change code, then reduceRegion with group reducer.
+  var areaRaw = ee.Image.pixelArea()                 // band 0 = pixel m²
+    .addBands(changeImg)                             // band 1 = change code
+    .reduceRegion({
+      reducer  : ee.Reducer.sum().group({groupField: 1, groupName: 'code'}),
+      geometry : AOI,
+      scale    : 30,
+      maxPixels: 1e13,
+      tileScale: 8      // bigger tileScale to avoid memory errors
+    });
+
+  // If AOI has no pixels for some transitions, groups may be null — guard.
+  var groupsList = ee.Algorithms.If(
+    areaRaw.contains('groups'),
+    areaRaw.get('groups'),
+    []
+  );
+
+  // Convert list of {code, sum} dictionaries to FeatureCollection rows.
+  var areaFC = ee.FeatureCollection(
+    ee.List(groupsList).map(function (item) {
+      item      = ee.Dictionary(item);
+      var code  = ee.Number(item.get('code'));
+      var areaHa= ee.Number(item.get('sum')).divide(1e4);  // m² → ha
+
+      return ee.Feature(null, {
+        from       : code.divide(100).floor(),
+        to         : code.mod(100),
+        area_ha    : areaHa,
+        changeCode : code,
+        period     : fromYr + '_' + toYr
+      });
+    })
+  );
+
+  Export.table.toDrive({
+    collection : areaFC,
+    description: 'ChangeTable_'+fromYr+'_'+toYr,
+    folder     : 'H1_final',
+    fileFormat : 'CSV'
+  });
+});
+
+print('All tasks queued — classification, fragmentation & change detection complete!');
+
+
+
